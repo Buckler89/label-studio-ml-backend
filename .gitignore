@@ -132,3 +132,8 @@ dmypy.json
 .github/actions-hub
 
 .idea/
+label_studio_ml/examples/segment_anything_2_video/segment-anything-2
+
+label_studio_ml/examples/segment_anything_2_video/cache.db
+
+label_studio_ml/examples/cache.db
