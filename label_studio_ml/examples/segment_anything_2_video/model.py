@@ -34,6 +34,9 @@ ANNOTATION_WORKAROUND = os.getenv('ANNOTATION_WORKAROUND', False)
 DEBUG = os.getenv('DEBUG', False)
 LABEL_STUDIO_API_KEY = os.getenv('LABEL_STUDIO_API_KEY', '')
 
+if DEBUG:
+    logging.basicConfig(level=logging.DEBUG)
+
 if DEVICE == 'cuda':
     # use bfloat16 for the entire notebook
     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
@@ -256,7 +259,12 @@ class NewModel(LabelStudioMLBase):
         Returns:
             ModelResponse: Response containing predicted annotations for the video frames.
         """
-        from_name, to_name, value = self.get_first_tag_occurence('VideoRectangle', 'Video')
+        from_name, to_name, value = self.get_first_tag_occurence('VideoRectangle', 'Video',
+                                                                 name_filter=lambda x: x == context['result'][0]['from_name'],
+                                                                 to_name_filter=lambda x: x == context['result'][0]['to_name'],
+                                                                 )
+        value, value_url= value.split('.')
+
         try:
             drafts = tasks[0]['drafts'][0]
         except IndexError:
@@ -269,26 +277,34 @@ class NewModel(LabelStudioMLBase):
         if not len(drafts):
             logger.info('Draft empty, using context')
             drafts = context
+
+        # filter draft['result'] based on context object name: keep all the objects that belong to the context object
+        drafts_result_filt = [r for r in drafts['result'] if r['from_name'] == from_name and r['to_name'] == to_name]
+        draft_for_prompt = drafts.copy()
+        draft_for_prompt['result'] = drafts_result_filt
+        task_ann_result_filt = [r for r in tasks[0]['annotations'][0]['result'] if r['from_name'] == from_name and r['to_name'] == to_name]
+
         task = tasks[0]
         task_id = task['id']
         # Get the video URL from the task
-        video_url = task['data'][value]
+        video_url = task['data'][value][value_url]
 
         # cache the video locally
         video_path = get_local_path(video_url, task_id=task_id)
         logger.debug(f'Video path: {video_path}')
 
-        # get prompts from context
+
+        # get prompts
         # prompts = self.get_prompts(context)
-        prompts = self.get_prompts(drafts)
+        prompts = self.get_prompts(draft_for_prompt)
 
         context_ids = set([ctx['id'] for ctx in context['result']])
-        all_obj_ids = set([p['id'] for p in drafts['result']] +
-                          ([p['id'] for p in tasks[0]['annotations'][0]['result']] if len(tasks[0]['annotations']) else []))
+        all_obj_ids = set([p['id'] for p in draft_for_prompt['result']] +
+                          ([p['id'] for p in task_ann_result_filt] if len(tasks[0]['annotations']) else []))
         if not context_ids.issubset( all_obj_ids):
             # Returning here because the case where object ids in the context do not match the ids found in the annotations is not supported.
             # This remains an open issue but is not considered a substantial problem.
-            raise NotImplementedError(f'Context id {context_ids} not found in drafts result: {all_obj_ids}'
+            raise NotImplementedError(f'Context id {context_ids} not found in draft_for_prompt result: {all_obj_ids}'
                                       f'TODO merge context and drafts')
 
         # create a map from obj_id to integer
@@ -434,14 +450,15 @@ class NewModel(LabelStudioMLBase):
                         'sequence': new_sequence,
                         'labels': labels if labels else []
                     },
-                    'from_name': 'box',
-                    'to_name': 'video',
+                    'from_name': from_name,
+                    'to_name': to_name,
                     'type': 'videorectangle',
                     'origin': 'manual',
                     'id': obj_id
                 })
 
-
+            old_valid_result = [r for r in tasks[0]['annotations'][0]['result'] if r['from_name'] != from_name or r['to_name'] != to_name]
+            result = result + old_valid_result
             prediction = PredictionValue(
                 model_version=MODEL_CHECKPOINT,
                 score=1.0,
