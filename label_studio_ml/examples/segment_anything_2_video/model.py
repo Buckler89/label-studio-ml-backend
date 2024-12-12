@@ -282,7 +282,8 @@ class NewModel(LabelStudioMLBase):
         drafts_result_filt = [r for r in drafts['result'] if r['from_name'] == from_name and r['to_name'] == to_name]
         draft_for_prompt = drafts.copy()
         draft_for_prompt['result'] = drafts_result_filt
-        task_ann_result_filt = [r for r in tasks[0]['annotations'][0]['result'] if r['from_name'] == from_name and r['to_name'] == to_name]
+        annotation_result = tasks[0]['annotations'][0]['result'] if len(tasks[0]['annotations']) else []
+        task_ann_result_filt = [r for r in annotation_result if r['from_name'] == from_name and r['to_name'] == to_name]
 
         task = tasks[0]
         task_id = task['id']
@@ -347,90 +348,92 @@ class NewModel(LabelStudioMLBase):
             logger.debug(f'Video width={width}, height={height}')
 
             # get inference state
-            inference_state = get_inference_state(temp_dir)
-            predictor.reset_state(inference_state)
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
 
-            # Group prompts by 'obj_id' and sort them by 'frame_idx' in one step
-            prompt_id_dict = defaultdict(list)
-            [prompt_id_dict[prompt['obj_id']].append(prompt) for prompt in prompts]
+                inference_state = get_inference_state(temp_dir)
+                predictor.reset_state(inference_state)
 
-            # Sort the prompts and extract the highest frame index for each object ID
-            highest_frames = [sorted(prompts, key=lambda x: x['frame_idx'])[-1]['frame_idx'] for prompts in
-                              prompt_id_dict.values() if prompts]
+                # Group prompts by 'obj_id' and sort them by 'frame_idx' in one step
+                prompt_id_dict = defaultdict(list)
+                [prompt_id_dict[prompt['obj_id']].append(prompt) for prompt in prompts]
 
-            # Get the minimum value of the highest frame indices
-            prompt_idx = min(highest_frames) if highest_frames else None
+                # Sort the prompts and extract the highest frame index for each object ID
+                highest_frames = [sorted(prompts, key=lambda x: x['frame_idx'])[-1]['frame_idx'] for prompts in
+                                  prompt_id_dict.values() if prompts]
 
-            for prompt in prompts:
+                # Get the minimum value of the highest frame indices
+                prompt_idx = min(highest_frames) if highest_frames else None
 
-                frame_idx = prompt['frame_idx'] - first_frame_idx
-                # sam 2 not predict other frame if are present prompts after the frame: the prompt must be set in the same frame for each object
-                if frame_idx > prompt_idx:
-                    logger.warning(f'Prompt frame index {frame_idx} is out of bounds')
-                    continue
+                for prompt in prompts:
+
+                    frame_idx = prompt['frame_idx'] - first_frame_idx
+                    # sam 2 not predict other frame if are present prompts after the frame: the prompt must be set in the same frame for each object
+                    if frame_idx > prompt_idx:
+                        logger.warning(f'Prompt frame index {frame_idx} is out of bounds')
+                        continue
 
 
-                if PROMPT_TYPE == 'point':
-                    # multiply points by the frame size
-                    prompt['points'][:, 0] *= width
-                    prompt['points'][:, 1] *= height
-                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=frame_idx,
-                        obj_id=obj_ids[prompt['obj_id']],
-                        points=prompt['points'],
-                        labels=prompt['labels']
-                    )
-                elif PROMPT_TYPE == 'box':
-                    # multiply points by the frame size
-                    prompt['points'][0] *= width
-                    prompt['points'][1] *= height
-                    prompt['points'][2] *= width
-                    prompt['points'][3] *= height
-                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                        inference_state=inference_state,
-                        frame_idx=frame_idx,
-                        obj_id=obj_ids[prompt['obj_id']],
-                        box=prompt['points'],
-                    )
-            if DEBUG:
-              debug_dir = './debug-frames'
-              os.makedirs(debug_dir, exist_ok=True)
+                    if PROMPT_TYPE == 'point':
+                        # multiply points by the frame size
+                        prompt['points'][:, 0] *= width
+                        prompt['points'][:, 1] *= height
+                        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=frame_idx,
+                            obj_id=obj_ids[prompt['obj_id']],
+                            points=prompt['points'],
+                            labels=prompt['labels']
+                        )
+                    elif PROMPT_TYPE == 'box':
+                        # multiply points by the frame size
+                        prompt['points'][0] *= width
+                        prompt['points'][1] *= height
+                        prompt['points'][2] *= width
+                        prompt['points'][3] *= height
+                        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=frame_idx,
+                            obj_id=obj_ids[prompt['obj_id']],
+                            box=prompt['points'],
+                        )
+                if DEBUG:
+                  debug_dir = './debug-frames'
+                  os.makedirs(debug_dir, exist_ok=True)
 
-            sequences = dict()
-            logger.info(f'Propagating in video from frame {last_frame_idx} to {last_frame_idx + frames_to_track}')
-            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-                inference_state=inference_state,
-                start_frame_idx=last_frame_idx,
-                max_frame_num_to_track=frames_to_track
-            ):
-                real_frame_idx = out_frame_idx + first_frame_idx
-                for i, out_obj_id in enumerate(out_obj_ids):
-                    mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+                sequences = dict()
+                logger.info(f'Propagating in video from frame {last_frame_idx} to {last_frame_idx + frames_to_track}')
+                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                    inference_state=inference_state,
+                    start_frame_idx=last_frame_idx,
+                    max_frame_num_to_track=frames_to_track
+                ):
+                    real_frame_idx = out_frame_idx + first_frame_idx
+                    for i, out_obj_id in enumerate(out_obj_ids):
+                        mask = (out_mask_logits[i] > 0.0).cpu().numpy()
 
-                    if DEBUG:
+                        if DEBUG:
 
-                      # to debug, save the mask as an image
-                      self.dump_image_with_mask(frames[out_frame_idx][1], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
+                          # to debug, save the mask as an image
+                          self.dump_image_with_mask(frames[out_frame_idx][1], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
 
-                    bbox = self.convert_mask_to_bbox(mask)
-                    if bbox:
-                        obj_id = next((k for k, v in obj_ids.items() if v == out_obj_id), None)
-                        sequences[obj_id] = sequences.get(obj_id, [])
-                        sequences[obj_id].append({
-                            'frame': real_frame_idx + 1,
-                            # 'x': bbox['x'] / width * 100,
-                            # 'y': bbox['y'] / height * 100,
-                            # 'width': bbox['width'] / width * 100,
-                            # 'height': bbox['height'] / height * 100,
-                            'x': bbox['x'],
-                            'y': bbox['y'],
-                            'width': bbox['width'],
-                            'height': bbox['height'],
-                            'enabled': True,
-                            'rotation': 0,
-                            'time': out_frame_idx / fps
-                        })
+                        bbox = self.convert_mask_to_bbox(mask)
+                        if bbox:
+                            obj_id = next((k for k, v in obj_ids.items() if v == out_obj_id), None)
+                            sequences[obj_id] = sequences.get(obj_id, [])
+                            sequences[obj_id].append({
+                                'frame': real_frame_idx + 1,
+                                # 'x': bbox['x'] / width * 100,
+                                # 'y': bbox['y'] / height * 100,
+                                # 'width': bbox['width'] / width * 100,
+                                # 'height': bbox['height'] / height * 100,
+                                'x': bbox['x'],
+                                'y': bbox['y'],
+                                'width': bbox['width'],
+                                'height': bbox['height'],
+                                'enabled': True,
+                                'rotation': 0,
+                                'time': out_frame_idx / fps
+                            })
             result = []
             for obj_id in all_obj_ids:
                 # find the context to use by searching on drafts by obj_id
@@ -457,7 +460,7 @@ class NewModel(LabelStudioMLBase):
                     'id': obj_id
                 })
 
-            old_valid_result = [r for r in tasks[0]['annotations'][0]['result'] if r['from_name'] != from_name or r['to_name'] != to_name]
+            old_valid_result = [r for r in annotation_result if r['from_name'] != from_name or r['to_name'] != to_name]
             result = result + old_valid_result
             prediction = PredictionValue(
                 model_version=MODEL_CHECKPOINT,
