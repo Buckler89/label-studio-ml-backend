@@ -319,7 +319,7 @@ class NewModel(LabelStudioMLBase):
         else:
             first_frame_idx = min(p['frame_idx'] for p in prompts) if prompts else 0
             # the minimum of the maximum frame_idx of all objects grouped by id
-            last_frame_idx = min(max(p['frame_idx'] for p in prompts if p['obj_id'] == obj_id) for obj_id in all_obj_ids)
+            last_frame_idx = min(max([[p['frame_idx'] for p in prompts if p['obj_id'] == obj_id] for obj_id in all_obj_ids]))
         frames_count, duration = self._get_fps(context)
         fps = frames_count / duration
 
