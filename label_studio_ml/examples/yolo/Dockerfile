@@ -11,6 +11,7 @@ RUN --mount=type=cache,target="/var/cache/apt",sharing=locked \
     apt-get -y update \
     && apt-get install -y git \
     && apt-get install -y wget \
+    && apt-get install -y curl \
     && apt-get install -y g++ freeglut3-dev build-essential libx11-dev \
     libxmu-dev libxi-dev libglu1-mesa libglu1-mesa-dev libfreeimage-dev \
     && apt-get -y install ffmpeg libsm6 libxext6 libffi-dev python3-dev python3-pip gcc
@@ -23,7 +24,6 @@ ENV PYTHONUNBUFFERED=1 \
     THREADS=4 \
     CUDA_HOME=/usr/local/cuda
 
-RUN conda install -c "nvidia/label/cuda-12.1.1" cuda -y
 ENV CUDA_HOME=/opt/conda \
     TORCH_CUDA_ARCH_LIST="6.0;6.1;7.0;7.5;8.0;8.6+PTX;8.9;9.0"
 

@@ -4,6 +4,7 @@ services:
   flair:
     container_name: flair
     image: heartexlabs/label-studio-ml-backend:flair-master
+    init: true
     build:
       context: .
       args:
@@ -13,6 +14,6 @@ services:
       - WORKERS=1
       - THREADS=8
       - LOG_LEVEL=DEBUG
-      - FLAIR_MODEL_NAME=ner
+      - FLAIR_MODEL_NAME=ner-multi
     ports:
       - "9090:9090"
