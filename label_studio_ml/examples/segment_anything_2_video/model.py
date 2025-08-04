@@ -36,6 +36,8 @@ if DEVICE == 'cuda':
 
 # build path to the model checkpoint
 sam2_checkpoint = str(pathlib.Path(__file__).parent / SEGMENT_ANYTHING_2_REPO_PATH / "checkpoints" / MODEL_CHECKPOINT)
+logger.debug(f'Model checkpoint: {sam2_checkpoint}')
+logger.debug(f'Model config: {MODEL_CONFIG}')
 predictor = build_sam2_video_predictor(MODEL_CONFIG, sam2_checkpoint)
 
 
@@ -57,45 +59,38 @@ class NewModel(LabelStudioMLBase):
     """
 
     def split_frames(self, video_path, temp_dir, start_frame=0, end_frame=100):
-        # Open the video file
         logger.debug(f'Opening video file: {video_path}')
         video = cv2.VideoCapture(video_path)
 
-        # check if loaded correctly
         if not video.isOpened():
             raise ValueError(f"Could not open video file: {video_path}")
-        else:
-            # display number of frames
-            logger.debug(f'Number of frames: {int(video.get(cv2.CAP_PROP_FRAME_COUNT))}')
+
+        logger.debug(f'Number of frames: {int(video.get(cv2.CAP_PROP_FRAME_COUNT))}')
 
         frame_count = 0
         while True:
-            # Read a frame from the video
             success, frame = video.read()
-            if frame_count < start_frame:
-                continue
-            if frame_count + start_frame >= end_frame:
-                break
 
-            # If frame is read correctly, success is True
             if not success:
                 logger.error(f'Failed to read frame {frame_count}')
                 break
 
-            # Generate a filename for the frame using the pattern with frame number: '%05d.jpg'
-            frame_filename = os.path.join(temp_dir, f'{frame_count:05d}.jpg')
-            if os.path.exists(frame_filename):
-                logger.debug(f'Frame {frame_count}: {frame_filename} already exists')
-                yield frame_filename, frame
-            else:
-                # Save the frame as an image file
-                cv2.imwrite(frame_filename, frame)
-                logger.debug(f'Frame {frame_count}: {frame_filename}')
-                yield frame_filename, frame
+            if frame_count < start_frame:
+                frame_count += 1
+                continue
 
+            if frame_count >= end_frame:
+                break
+
+            frame_filename = os.path.join(temp_dir, f'{frame_count:05d}.jpg')
+
+            if not os.path.exists(frame_filename):
+                cv2.imwrite(frame_filename, frame)
+
+            logger.debug(f'Frame {frame_count}: {frame_filename}')
+            yield frame_filename, frame
             frame_count += 1
 
-        # Release the video object
         video.release()
 
     def get_prompts(self, context) -> List[Dict]:
@@ -271,9 +266,9 @@ class NewModel(LabelStudioMLBase):
                 prompt['points'][:, 0] *= width
                 prompt['points'][:, 1] *= height
 
-                _, out_obj_ids, out_mask_logits = predictor.add_new_points(
+                _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
                     inference_state=inference_state,
-                    frame_idx=prompt['frame_idx'],
+                    frame_idx=prompt['frame_idx'] - first_frame_idx,
                     obj_id=obj_ids[prompt['obj_id']],
                     points=prompt['points'],
                     labels=prompt['labels']
