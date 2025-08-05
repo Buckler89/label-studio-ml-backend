@@ -1,10 +1,8 @@
 import os
-import pathlib
 import tempfile
 import logging
 import json
 from typing import List, Dict, Optional, Literal, cast
-import sys
 
 import cv2
 import torch
@@ -14,44 +12,60 @@ from label_studio_ml.model import LabelStudioMLBase
 from label_studio_ml.response import ModelResponse
 from label_studio_sdk._extensions.label_studio_tools.core.utils.io import get_local_path
 from label_studio_sdk.label_interface.objects import PredictionValue
-# from PIL import Image
 from collections import defaultdict
 from label_studio_sdk.client import LabelStudio
+from decord import VideoReader
+from decord import cpu, gpu
 
-# read the environment variables and set the paths just before importing the sam2 module
-SEGMENT_ANYTHING_2_REPO_PATH = os.getenv('SEGMENT_ANYTHING_2_REPO_PATH', 'segment-anything-2')
-sys.path.append(SEGMENT_ANYTHING_2_REPO_PATH)
-from sam2.build_sam import build_sam2, build_sam2_video_predictor
+from sam2.sam2_video_predictor import SAM2VideoPredictor
 
 logger = logging.getLogger(__name__)
 
 DEVICE = os.getenv('DEVICE', 'cuda')
 MODEL_CONFIG = os.getenv('MODEL_CONFIG', './configs/sam2.1/sam2.1_hiera_t.yaml')
-MODEL_CHECKPOINT = os.getenv('MODEL_CHECKPOINT', 'sam2.1_hiera_tiny.pt')
 MAX_FRAMES_TO_TRACK = int(os.getenv('MAX_FRAMES_TO_TRACK', 10))
 PROMPT_TYPE = cast(Literal["box", "point"], os.getenv('PROMPT_TYPE', 'box'))
 ANNOTATION_WORKAROUND = os.getenv('ANNOTATION_WORKAROUND', False)
-DEBUG = os.getenv('DEBUG', False)
+DEBUG = bool(int(os.getenv('DEBUG', False)))
 LABEL_STUDIO_API_KEY = os.getenv('LABEL_STUDIO_API_KEY', '')
 
 if DEBUG:
     logging.basicConfig(level=logging.DEBUG)
 
-if DEVICE == 'cuda':
-    # use bfloat16 for the entire notebook
-    torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+# if DEVICE == 'cuda':
+#     # use bfloat16 for the entire notebook
+#     torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+#
+#     if torch.cuda.get_device_properties(0).major >= 8:
+#         # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+#         torch.backends.cuda.matmul.allow_tf32 = True
+#         torch.backends.cudnn.allow_tf32 = True
 
-    if torch.cuda.get_device_properties(0).major >= 8:
+from torch.cuda.amp import autocast
+
+def get_safe_autocast():
+    if not torch.cuda.is_available():
+        return autocast(enabled=False)
+
+    major, minor = torch.cuda.get_device_capability()
+    # Ampere (8.0+) supporta BF16 e Tensor Cores
+    if major >= 8:
         # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
+        return autocast(dtype=torch.bfloat16)
+    # Volta/Turing (7.x) può supportare FP16
+    elif major >= 7:
+        return autocast(dtype=torch.float16)
+    else:
+        # GPU vecchie (Maxwell, Pascal): no mixed precision
+        return autocast(enabled=False)
 
 
 # build path to the model checkpoint
-sam2_checkpoint = str(pathlib.Path(__file__).parent / SEGMENT_ANYTHING_2_REPO_PATH / "checkpoints" / MODEL_CHECKPOINT)
-logger.debug(f'Model checkpoint: {sam2_checkpoint}')
 logger.debug(f'Model config: {MODEL_CONFIG}')
-predictor = build_sam2_video_predictor(MODEL_CONFIG, sam2_checkpoint) # todo --> use SAM2VideoPredictor from hf model download
+predictor = SAM2VideoPredictor.from_pretrained(MODEL_CONFIG)
+predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-tiny")
 
 
 # manage cache for inference state
@@ -69,48 +83,6 @@ def get_inference_state(video_dir):
 class NewModel(LabelStudioMLBase):
     """Custom ML Backend model
     """
-
-    def split_frames(self, video_path, temp_dir, start_frame=0, end_frame=100):
-        logger.debug(f'Opening video file: {video_path}')
-        video = cv2.VideoCapture(video_path)
-        fps = video.get(cv2.CAP_PROP_FPS)
-        frame_count = video.get(cv2.CAP_PROP_FRAME_COUNT)
-        logger.debug(f'fps: {fps}, frame_count: {frame_count}')
-        duration = frame_count / fps
-        print(f'duration: {duration}')
-
-        if not video.isOpened():
-            raise ValueError(f"Could not open video file: {video_path}")
-
-        logger.debug(f'Number of frames: {int(video.get(cv2.CAP_PROP_FRAME_COUNT))}')
-
-        frame_count = 0
-        while True:
-            success, frame = video.read()
-
-            if not success:
-                logger.error(f'Failed to read frame {frame_count}')
-                # manage this (frame 57 of acutal video test)
-                # poi risovli il problema del label con diverse etichette
-                break
-
-            if frame_count < start_frame:
-                frame_count += 1
-                continue
-
-            if frame_count >= end_frame:
-                break
-
-            frame_filename = os.path.join(temp_dir, f'{frame_count:05d}.jpg')
-
-            if not os.path.exists(frame_filename):
-                cv2.imwrite(frame_filename, frame)
-
-            logger.debug(f'Frame {frame_count}: {frame_filename}')
-            yield frame_filename, frame
-            frame_count += 1
-
-        video.release()
 
     def get_prompts(self, context) -> List[Dict]:
         logger.debug(f'Extracting keypoints from context: {context}')
@@ -293,7 +265,9 @@ class NewModel(LabelStudioMLBase):
         # cache the video locally
         video_path = get_local_path(video_url, task_id=task_id)
         logger.debug(f'Video path: {video_path}')
-
+        with open(video_path, 'rb') as f:
+            vr = VideoReader(f, ctx=cpu(0))
+            # vr = VideoReader(video_path, ctx=cpu(0) if DEVICE == 'cpu' else gpu(0))
 
         # get prompts
         # prompts = self.get_prompts(context)
@@ -339,18 +313,14 @@ class NewModel(LabelStudioMLBase):
             # os.makedirs(temp_dir, exist_ok=True)
 
             # get all frames
-            frames = list(self.split_frames(  # todo ---> remove this and use decord
-                video_path, temp_dir,
-                start_frame=first_frame_idx,
-                end_frame=last_frame_idx + frames_to_track
-            ))
-            height, width, _ = frames[0][1].shape
+            frames = vr.get_batch(list(np.arange(first_frame_idx, last_frame_idx + frames_to_track))).asnumpy()
+            n_frames, height, width, _ = frames.shape
             logger.debug(f'Video width={width}, height={height}')
 
             # get inference state
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16): # ---> use get_safe_autocast
+            with torch.inference_mode(), get_safe_autocast():
 
-                inference_state = get_inference_state(temp_dir)
+                inference_state = get_inference_state(video_path)
                 predictor.reset_state(inference_state)
 
                 # Group prompts by 'obj_id' and sort them by 'frame_idx' in one step
@@ -414,7 +384,7 @@ class NewModel(LabelStudioMLBase):
                         if DEBUG:
 
                           # to debug, save the mask as an image
-                          self.dump_image_with_mask(frames[out_frame_idx][1], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
+                          self.dump_image_with_mask(frames[out_frame_idx], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
 
                         bbox = self.convert_mask_to_bbox(mask)
                         if bbox:
@@ -463,7 +433,7 @@ class NewModel(LabelStudioMLBase):
             old_valid_result = [r for r in annotation_result if r['from_name'] != from_name or r['to_name'] != to_name]
             result = result + old_valid_result
             prediction = PredictionValue(
-                model_version=MODEL_CHECKPOINT,
+                model_version=MODEL_CONFIG,
                 score=1.0,
                 result=result
             )
