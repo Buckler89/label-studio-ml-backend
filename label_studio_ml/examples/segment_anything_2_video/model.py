@@ -51,7 +51,7 @@ if DEVICE == 'cuda':
 sam2_checkpoint = str(pathlib.Path(__file__).parent / SEGMENT_ANYTHING_2_REPO_PATH / "checkpoints" / MODEL_CHECKPOINT)
 logger.debug(f'Model checkpoint: {sam2_checkpoint}')
 logger.debug(f'Model config: {MODEL_CONFIG}')
-predictor = build_sam2_video_predictor(MODEL_CONFIG, sam2_checkpoint)
+predictor = build_sam2_video_predictor(MODEL_CONFIG, sam2_checkpoint) # todo --> use SAM2VideoPredictor from hf model download
 
 
 # manage cache for inference state
@@ -332,14 +332,14 @@ class NewModel(LabelStudioMLBase):
         frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count - last_frame_idx)
 
         # Split the video into frames
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory() as temp_dir:  # todo ---> remove this and use decord
 
             # # use persisted dir for debug
             # temp_dir = '/tmp/frames'
             # os.makedirs(temp_dir, exist_ok=True)
 
             # get all frames
-            frames = list(self.split_frames(
+            frames = list(self.split_frames(  # todo ---> remove this and use decord
                 video_path, temp_dir,
                 start_frame=first_frame_idx,
                 end_frame=last_frame_idx + frames_to_track
@@ -348,7 +348,7 @@ class NewModel(LabelStudioMLBase):
             logger.debug(f'Video width={width}, height={height}')
 
             # get inference state
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16): # ---> use get_safe_autocast
 
                 inference_state = get_inference_state(temp_dir)
                 predictor.reset_state(inference_state)
@@ -470,7 +470,7 @@ class NewModel(LabelStudioMLBase):
             logger.debug(f'Prediction: {prediction.model_dump()}')
             if DEBUG:
               with open('prediction.json', 'w') as f:
-                  json.dump(prediction.model_dump(), f)
+                  json.dump(prediction.model_dump(), f, indent=2)
 
             if ANNOTATION_WORKAROUND:
                 # this is a workaround to update the annotation in the Label Studio since using the model response shows all the objects with the same label
