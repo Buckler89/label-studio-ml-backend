@@ -80,130 +80,118 @@ def get_inference_state(video_dir):
         _inference_state = predictor.init_state(video_path=video_dir)
     return _inference_state
 
+
+def _get_fps(context):
+    # get the fps from the context
+    frames_count = context['result'][0]['value']['framesCount']
+    duration = context['result'][0]['value']['duration']
+    return frames_count, duration
+
+
+def convert_mask_to_bbox(mask):
+    # squeeze
+    mask = mask.squeeze()
+
+    y_indices, x_indices = np.where(mask == 1)
+    if len(x_indices) == 0 or len(y_indices) == 0:
+        return None
+
+    # Find the min and max indices
+    xmin, xmax = np.min(x_indices), np.max(x_indices)
+    ymin, ymax = np.min(y_indices), np.max(y_indices)
+
+    # Get mask dimensions
+    height, width = mask.shape
+
+    # Calculate bounding box dimensions
+    box_width = xmax - xmin + 1
+    box_height = ymax - ymin + 1
+
+    # Normalize and scale to percentage
+    x_pct = (xmin / width) * 100
+    y_pct = (ymin / height) * 100
+    width_pct = (box_width / width) * 100
+    height_pct = (box_height / height) * 100
+
+    return {
+        "x": round(x_pct, 2),
+        "y": round(y_pct, 2),
+        "width": round(width_pct, 2),
+        "height": round(height_pct, 2)
+    }
+
+
+def get_prompts(context) -> List[Dict]:
+    logger.debug(f'Extracting keypoints from context: {context}')
+    prompts = []
+    for ctx in context['result']:
+        # Process each video tracking object separately
+        obj_id = ctx['id']
+        for obj in ctx['value']['sequence']:
+            x = obj['x'] / 100
+            y = obj['y'] / 100
+            box_width = obj['width'] / 100
+            box_height = obj['height'] / 100
+            frame_idx = obj['frame'] - 1
+
+            if PROMPT_TYPE == 'point':
+                # SAM2 video works with keypoints - convert the rectangle to the set of keypoints within the rectangle
+                # bbox (x, y) is top-left corner
+                kps = [
+                    # center of the bbox
+                    [x + box_width / 2, y + box_height / 2],
+                    # half of the bbox width to the left
+                    [x + box_width / 4, y + box_height / 2],
+                    # half of the bbox width to the right
+                    [x + 3 * box_width / 4, y + box_height / 2],
+                    # half of the bbox height to the top
+                    [x + box_width / 2, y + box_height / 4],
+                    # half of the bbox height to the bottom
+                    [x + box_width / 2, y + 3 * box_height / 4]
+                ]
+            elif PROMPT_TYPE == 'box':
+                # SAM2 video works with boxes - use the rectangle inf xyxy format
+                kps = [x, y, x + box_width, y + box_height]
+            else:
+                raise ValueError(f'Invalid prompt type: {PROMPT_TYPE}')
+
+            points = np.array(kps, dtype=np.float32)
+            # labels are not used for box prompts
+            labels = np.array([1] * len(kps), dtype=np.int32) if PROMPT_TYPE == 'point' else None
+            prompts.append({
+                'points': points,
+                'labels': labels,
+                'frame_idx': frame_idx,
+                'obj_id': obj_id
+            })
+
+    return prompts
+
+
+def dump_image_with_mask(frame, mask, output_file, obj_id=None, random_color=False):
+    from matplotlib import pyplot as plt
+    if random_color:
+        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
+    else:
+        cmap = plt.get_cmap("tab10")
+        cmap_idx = 0 if obj_id is None else obj_id
+        color = np.array([*cmap(cmap_idx)[:3], 0.6])
+    h, w = mask.shape[-2:]
+    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
+
+    # create an image file to display image overlayed with mask
+    mask_image = (mask_image * 255).astype(np.uint8)
+    mask_image = cv2.cvtColor(mask_image, cv2.COLOR_BGRA2BGR)
+    mask_image = cv2.addWeighted(frame, 1.0, mask_image, 0.8, 0)
+    logger.debug(f'Shapes: frame={frame.shape}, mask={mask.shape}, mask_image={mask_image.shape}')
+    # save in file
+    logger.debug(f'Saving image with mask to {output_file}')
+    cv2.imwrite(output_file, mask_image)
+
+
 class NewModel(LabelStudioMLBase):
     """Custom ML Backend model
     """
-
-    def get_prompts(self, context) -> List[Dict]:
-        logger.debug(f'Extracting keypoints from context: {context}')
-        prompts = []
-        for ctx in context['result']:
-            # Process each video tracking object separately
-            obj_id = ctx['id']
-            for obj in ctx['value']['sequence']:
-                x = obj['x'] / 100
-                y = obj['y'] / 100
-                box_width = obj['width'] / 100
-                box_height = obj['height'] / 100
-                frame_idx = obj['frame'] - 1
-
-                if PROMPT_TYPE == 'point':
-                    # SAM2 video works with keypoints - convert the rectangle to the set of keypoints within the rectangle
-                    # bbox (x, y) is top-left corner
-                    kps = [
-                        # center of the bbox
-                        [x + box_width / 2, y + box_height / 2],
-                        # half of the bbox width to the left
-                        [x + box_width / 4, y + box_height / 2],
-                        # half of the bbox width to the right
-                        [x + 3 * box_width / 4, y + box_height / 2],
-                        # half of the bbox height to the top
-                        [x + box_width / 2, y + box_height / 4],
-                        # half of the bbox height to the bottom
-                        [x + box_width / 2, y + 3 * box_height / 4]
-                    ]
-                elif PROMPT_TYPE == 'box':
-                    # SAM2 video works with boxes - use the rectangle inf xyxy format
-                    kps = [x, y, x + box_width, y + box_height]
-                else:
-                    raise ValueError(f'Invalid prompt type: {PROMPT_TYPE}')
-
-                points = np.array(kps, dtype=np.float32)
-                # labels are not used for box prompts
-                labels = np.array([1] * len(kps), dtype=np.int32) if PROMPT_TYPE == 'point' else None
-                prompts.append({
-                    'points': points,
-                    'labels': labels,
-                    'frame_idx': frame_idx,
-                    'obj_id': obj_id
-                })
-
-        return prompts
-
-    def _get_fps(self, context):
-        # get the fps from the context
-        frames_count = context['result'][0]['value']['framesCount']
-        duration = context['result'][0]['value']['duration']
-        return frames_count, duration
-
-    # def convert_mask_to_bbox(self, mask):
-    #     # convert mask to bbox
-    #     h, w = mask.shape[-2:]
-    #     mask_int = mask.reshape(h, w, 1).astype(np.uint8)
-    #     contours, _ = cv2.findContours(mask_int, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    #     if len(contours) == 0:
-    #         return None
-    #     x, y, w, h = cv2.boundingRect(contours[0])
-    #     return {
-    #         'x': x,
-    #         'y': y,
-    #         'width': w,
-    #         'height': h
-    #     }
-
-    def convert_mask_to_bbox(self, mask):
-        # squeeze
-        mask = mask.squeeze()
-
-        y_indices, x_indices = np.where(mask == 1)
-        if len(x_indices) == 0 or len(y_indices) == 0:
-            return None
-
-        # Find the min and max indices
-        xmin, xmax = np.min(x_indices), np.max(x_indices)
-        ymin, ymax = np.min(y_indices), np.max(y_indices)
-
-        # Get mask dimensions
-        height, width = mask.shape
-
-        # Calculate bounding box dimensions
-        box_width = xmax - xmin + 1
-        box_height = ymax - ymin + 1
-
-        # Normalize and scale to percentage
-        x_pct = (xmin / width) * 100
-        y_pct = (ymin / height) * 100
-        width_pct = (box_width / width) * 100
-        height_pct = (box_height / height) * 100
-
-        return {
-            "x": round(x_pct, 2),
-            "y": round(y_pct, 2),
-            "width": round(width_pct, 2),
-            "height": round(height_pct, 2)
-        }
-
-
-    def dump_image_with_mask(self, frame, mask, output_file, obj_id=None, random_color=False):
-        from matplotlib import pyplot as plt
-        if random_color:
-            color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-        else:
-            cmap = plt.get_cmap("tab10")
-            cmap_idx = 0 if obj_id is None else obj_id
-            color = np.array([*cmap(cmap_idx)[:3], 0.6])
-        h, w = mask.shape[-2:]
-        mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-
-        # create an image file to display image overlayed with mask
-        mask_image = (mask_image * 255).astype(np.uint8)
-        mask_image = cv2.cvtColor(mask_image, cv2.COLOR_BGRA2BGR)
-        mask_image = cv2.addWeighted(frame, 1.0, mask_image, 0.8, 0)
-        logger.debug(f'Shapes: frame={frame.shape}, mask={mask.shape}, mask_image={mask_image.shape}')
-        # save in file
-        logger.debug(f'Saving image with mask to {output_file}')
-        cv2.imwrite(output_file, mask_image)
-
 
     def predict(self, tasks: List[Dict], context: Optional[Dict] = None, **kwargs) -> ModelResponse:
         """
@@ -271,7 +259,7 @@ class NewModel(LabelStudioMLBase):
 
         # get prompts
         # prompts = self.get_prompts(context)
-        prompts = self.get_prompts(draft_for_prompt)
+        prompts = get_prompts(draft_for_prompt)
 
         context_ids = set([ctx['id'] for ctx in context['result']])
         all_obj_ids = set([p['id'] for p in draft_for_prompt['result']] +
@@ -294,7 +282,7 @@ class NewModel(LabelStudioMLBase):
             first_frame_idx = min(p['frame_idx'] for p in prompts) if prompts else 0
             # the minimum of the maximum frame_idx of all objects grouped by id
             last_frame_idx = min(max([[p['frame_idx'] for p in prompts if p['obj_id'] == obj_id] for obj_id in all_obj_ids]))
-        frames_count, duration = self._get_fps(context)
+        frames_count, duration = _get_fps(context)
         fps = frames_count / duration
 
         logger.debug(
@@ -384,9 +372,9 @@ class NewModel(LabelStudioMLBase):
                         if DEBUG:
 
                           # to debug, save the mask as an image
-                          self.dump_image_with_mask(frames[out_frame_idx], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
+                          dump_image_with_mask(frames[out_frame_idx], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
 
-                        bbox = self.convert_mask_to_bbox(mask)
+                        bbox = convert_mask_to_bbox(mask)
                         if bbox:
                             obj_id = next((k for k, v in obj_ids.items() if v == out_obj_id), None)
                             sequences[obj_id] = sequences.get(obj_id, [])
