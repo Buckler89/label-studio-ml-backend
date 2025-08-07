@@ -28,7 +28,8 @@ PROMPT_TYPE = cast(Literal["box", "point"], os.getenv('PROMPT_TYPE', 'box'))
 ANNOTATION_WORKAROUND = os.getenv('ANNOTATION_WORKAROUND', False)
 DEBUG = bool(int(os.getenv('DEBUG', False)))
 LABEL_STUDIO_API_KEY = os.getenv('LABEL_STUDIO_API_KEY', '')
-MINIMUM_OBJECT_AREA_THRESHOLD = float(os.getenv("MINIMUM_OBJECT_AREA_THRESHOLD", 100.0))
+MINIMUM_OBJECT_AREA_THRESHOLD = float(os.getenv("MINIMUM_OBJECT_AREA_THRESHOLD", float('inf'))) # Set to float('inf')
+# to disable the threshold by default
 
 if DEBUG:
     logging.basicConfig(level=logging.DEBUG)
