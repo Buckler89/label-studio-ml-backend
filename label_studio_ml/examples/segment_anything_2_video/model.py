@@ -313,7 +313,7 @@ class NewModel(LabelStudioMLBase):
                                       f'TODO merge context and drafts')
 
         # create a map from obj_id to integer
-        obj_ids = {obj_id: i for i, obj_id in enumerate(all_obj_ids)}
+        obj_ids = {obj_id: dict(idx=i) for i, obj_id in enumerate(all_obj_ids)}
         # find the last frame index
         # if there is only one object, use the last frame of the object: continue tracking from last tracked frame
         # if there are multiple objects, use the smallest frame index of all objects
@@ -380,7 +380,7 @@ class NewModel(LabelStudioMLBase):
                     _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
                         inference_state=inference_state,
                         frame_idx=frame_idx,
-                        obj_id=obj_ids[prompt['obj_id']],
+                        obj_id=obj_ids[prompt['obj_id']]['idx'],
                         points=prompt['points'],
                         labels=prompt['labels']
                     )
@@ -395,7 +395,7 @@ class NewModel(LabelStudioMLBase):
                     _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
                         inference_state=inference_state,
                         frame_idx=frame_idx,
-                        obj_id=obj_ids[prompt['obj_id']],
+                        obj_id=obj_ids[prompt['obj_id']]['idx'],
                         box=prompt['box'],
                     )
             if DEBUG:
@@ -423,7 +423,7 @@ class NewModel(LabelStudioMLBase):
 
                     bbox = convert_mask_to_bbox(mask)
                     if bbox:
-                        obj_id = next((k for k, v in obj_ids.items() if v == out_obj_id), None)
+                        obj_id = next((k for k, v in obj_ids.items() if v['idx'] == out_obj_id), None)
                         sequences[obj_id] = sequences.get(obj_id, [])
                         sequences[obj_id].append({
                             'frame': real_frame_idx + 1, # +1 because frames are 1-indexed in Label Studio
