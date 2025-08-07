@@ -2,6 +2,7 @@
 name = "label-studio-ml-backend"
 version = "1.0.21"
 description = "custom verison of sam2 video"
+package-mode = false
 authors = [
     {name = "Diego Droghini",email = "diego.droghini@xtechnologies.it"}
 ]

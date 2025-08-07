@@ -73,7 +73,7 @@ def get_safe_autocast():
 # build path to the model checkpoint
 logger.debug(f'Model config: {MODEL_CONFIG}')
 predictor = SAM2VideoPredictor.from_pretrained(MODEL_CONFIG)
-predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-tiny")
+# predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-tiny")
 
 
 # manage cache for inference state
