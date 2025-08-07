@@ -28,6 +28,7 @@ PROMPT_TYPE = cast(Literal["box", "point"], os.getenv('PROMPT_TYPE', 'box'))
 ANNOTATION_WORKAROUND = os.getenv('ANNOTATION_WORKAROUND', False)
 DEBUG = bool(int(os.getenv('DEBUG', False)))
 LABEL_STUDIO_API_KEY = os.getenv('LABEL_STUDIO_API_KEY', '')
+MINIMUM_OBJECT_AREA_THRESHOLD = float(os.getenv("MINIMUM_OBJECT_AREA_THRESHOLD", 100.0))
 
 if DEBUG:
     logging.basicConfig(level=logging.DEBUG)
@@ -127,6 +128,42 @@ def convert_mask_to_bbox(mask):
         "width": round(width_pct, 2),
         "height": round(height_pct, 2)
     }
+
+
+def extract_bbox_info_from_prompts(prompts, obj_id):
+    """
+    Extract original bounding box dimensions and area from prompts for a specific object ID.
+    
+    Args:
+        prompts (List[Dict]): List of prompt dictionaries
+        obj_id: The object ID to extract bbox info for
+        
+    Returns:
+        Dict: Dictionary containing original_width, original_height, and original_area
+    """
+    # Filter prompts for the specific object ID
+    obj_prompts = [p for p in prompts if p['obj_id'] == obj_id]
+    
+    if not obj_prompts:
+        return None
+    
+    # Get the first prompt for this object that has box information
+    box_prompt = next((p for p in obj_prompts if 'box' in p), None)
+    
+    if box_prompt:
+        # Box is stored as [x1, y1, x2, y2] in normalized coordinates (0-1)
+        box = box_prompt['box']
+        width = box[2] - box[0]  # x2 - x1
+        height = box[3] - box[1]  # y2 - y1
+        area = width * height
+        
+        return {
+            "original_width": width * 100,  # Convert to percentage
+            "original_height": height * 100,  # Convert to percentage
+            "original_area": area * 100 * 100  # Convert to percentage squared
+        }
+    
+    return None
 
 
 def get_prompts(context, points_from_box: str | bool = False) -> List[Dict]:
@@ -314,6 +351,13 @@ class NewModel(LabelStudioMLBase):
 
         # create a map from obj_id to integer
         obj_ids = {obj_id: dict(idx=i) for i, obj_id in enumerate(all_obj_ids)}
+        
+        # Step 1: Add original bounding box dimensions and area
+        for obj_id in all_obj_ids:
+            bbox_info = extract_bbox_info_from_prompts(prompts, obj_id)
+            if bbox_info:
+                obj_ids[obj_id].update(bbox_info)
+        
         # find the last frame index
         # if there is only one object, use the last frame of the object: continue tracking from last tracked frame
         # if there are multiple objects, use the smallest frame index of all objects
@@ -425,6 +469,22 @@ class NewModel(LabelStudioMLBase):
                     if bbox:
                         obj_id = next((k for k, v in obj_ids.items() if v['idx'] == out_obj_id), None)
                         sequences[obj_id] = sequences.get(obj_id, [])
+                        
+                        # Step 2: Adjust predicted BBoxes for small area objects
+                        predicted_area = bbox['width'] * bbox['height']
+                        if predicted_area < MINIMUM_OBJECT_AREA_THRESHOLD and 'original_width' in obj_ids[obj_id] and 'original_height' in obj_ids[obj_id]:
+                            # Keep the center but use original dimensions
+                            center_x = bbox['x'] + bbox['width'] / 2
+                            center_y = bbox['y'] + bbox['height'] / 2
+                            original_width = obj_ids[obj_id]['original_width']
+                            original_height = obj_ids[obj_id]['original_height']
+                            
+                            # Recalculate x, y to maintain the center position
+                            bbox['x'] = center_x - original_width / 2
+                            bbox['y'] = center_y - original_height / 2
+                            bbox['width'] = original_width
+                            bbox['height'] = original_height
+                        
                         sequences[obj_id].append({
                             'frame': real_frame_idx + 1, # +1 because frames are 1-indexed in Label Studio
                             # 'x': bbox['x'] / width * 100,
