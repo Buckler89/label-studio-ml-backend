@@ -41,26 +41,34 @@ if DEBUG:
 #         torch.backends.cuda.matmul.allow_tf32 = True
 #         torch.backends.cudnn.allow_tf32 = True
 
-from torch.cuda.amp import autocast
+from torch.amp import autocast
+
+# def get_safe_autocast():
+#     if not torch.cuda.is_available():
+#         return autocast('cuda', enabled=False)
+#
+#     major, minor = torch.cuda.get_device_capability()
+#     # Ampere (8.0+) supporta BF16 e Tensor Cores
+#     if major >= 8:
+#         # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+#         torch.backends.cuda.matmul.allow_tf32 = True
+#         torch.backends.cudnn.allow_tf32 = True
+#         return autocast('cuda', dtype=torch.bfloat16)
+#     # Volta/Turing (7.x) può supportare FP16
+#     elif major >= 7:
+#         return autocast('cuda', dtype=torch.float16)
+#     else:
+#         # GPU vecchie (Maxwell, Pascal): no mixed precision
+#         return autocast('cuda', enabled=False)
+
 
 def get_safe_autocast():
     if not torch.cuda.is_available():
-        return autocast(enabled=False)
+        return autocast('cuda', enabled=False)
 
-    major, minor = torch.cuda.get_device_capability()
-    # Ampere (8.0+) supporta BF16 e Tensor Cores
-    if major >= 8:
-        # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        return autocast(dtype=torch.bfloat16)
-    # Volta/Turing (7.x) può supportare FP16
-    elif major >= 7:
-        return autocast(dtype=torch.float16)
-    else:
-        # GPU vecchie (Maxwell, Pascal): no mixed precision
-        return autocast(enabled=False)
-
+    # For SAM2, it's safer to use float32 to avoid dtype mismatches
+    # The model architecture has some components that don't play well with mixed precision
+    return autocast('cuda', dtype=torch.float32, enabled=True)
 
 # build path to the model checkpoint
 logger.debug(f'Model config: {MODEL_CONFIG}')
@@ -121,7 +129,7 @@ def convert_mask_to_bbox(mask):
     }
 
 
-def get_prompts(context) -> List[Dict]:
+def get_prompts(context, points_from_box: str | bool = False) -> List[Dict]:
     logger.debug(f'Extracting keypoints from context: {context}')
     prompts = []
     for ctx in context['result']:
@@ -149,21 +157,55 @@ def get_prompts(context) -> List[Dict]:
                     # half of the bbox height to the bottom
                     [x + box_width / 2, y + 3 * box_height / 4]
                 ]
+                labels = np.array([1] * len(kps), dtype=np.int32) if PROMPT_TYPE == 'point' else None
+                prompts.append({
+                    'points': np.array(kps, dtype=np.float32),
+                    'labels': labels,
+                    'frame_idx': frame_idx,
+                    'obj_id': obj_id
+                })
             elif PROMPT_TYPE == 'box':
                 # SAM2 video works with boxes - use the rectangle inf xyxy format
                 kps = [x, y, x + box_width, y + box_height]
+                # labels are not used for box prompts
+                prompts.append({
+                    'box': kps,
+                    'labels': None,
+                    'frame_idx': frame_idx,
+                    'obj_id': obj_id
+                })
+                # if points_from_box is True, generate 1 points at the center to the box with positive labels and 8 points
+                # on the box edges with negative labels
+                if points_from_box:
+                    # generate 1 point at the center of the box with positive label
+                    kps = [
+                        [x + box_width / 2, y + box_height / 2]
+                    ]
+                    # generate 8 points on the box edges: vertex points and midpoints of each edge
+                    kps += [
+                        [x, y],  # top-left corner
+                        [x + box_width, y],  # top-right corner
+                        [x + box_width, y + box_height],  # bottom-right corner
+                        [x, y + box_height],  # bottom-left corner
+                        [x + box_width / 2, y],  # top edge midpoint
+                        [x + box_width, y + box_height / 2],  # right edge midpoint
+                        [x + box_width / 2, y + box_height],  # bottom edge midpoint
+                        [x, y + box_height / 2]  # left edge midpoint
+                    ]
+                    # create labels: 3 points inside the box with positive labels, 8 points on
+                    # the box edges with negative labels
+                    labels = np.array([1] * 3 + [-1] * 8, dtype=np.int32)
+                    prompts.append({
+                        'points': np.array(kps, dtype=np.float32),
+                        'labels': labels,
+                        'frame_idx': frame_idx,
+                        'obj_id': obj_id
+                    })
+
             else:
                 raise ValueError(f'Invalid prompt type: {PROMPT_TYPE}')
 
-            points = np.array(kps, dtype=np.float32)
-            # labels are not used for box prompts
-            labels = np.array([1] * len(kps), dtype=np.int32) if PROMPT_TYPE == 'point' else None
-            prompts.append({
-                'points': points,
-                'labels': labels,
-                'frame_idx': frame_idx,
-                'obj_id': obj_id
-            })
+
 
     return prompts
 
@@ -223,7 +265,7 @@ class NewModel(LabelStudioMLBase):
                                                                  name_filter=lambda x: x == context['result'][0]['from_name'],
                                                                  to_name_filter=lambda x: x == context['result'][0]['to_name'],
                                                                  )
-        value, value_url= value.split('.')
+        value, value_url = value.split('.')
 
         try:
             drafts = tasks[0]['drafts'][0]
@@ -259,7 +301,7 @@ class NewModel(LabelStudioMLBase):
 
         # get prompts
         # prompts = self.get_prompts(context)
-        prompts = get_prompts(draft_for_prompt)
+        prompts = get_prompts(draft_for_prompt, points_from_box=True)
 
         context_ids = set([ctx['id'] for ctx in context['result']])
         all_obj_ids = set([p['id'] for p in draft_for_prompt['result']] +
@@ -291,173 +333,179 @@ class NewModel(LabelStudioMLBase):
             f'last frame index: {last_frame_idx}, '
             f'obj_ids: {obj_ids}')
 
-        frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count - last_frame_idx)
+        # frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count - last_frame_idx)
+        frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count)
+        # # use persisted dir for debug
+        # temp_dir = '/tmp/frames'
+        # os.makedirs(temp_dir, exist_ok=True)
 
-        # Split the video into frames
-        with tempfile.TemporaryDirectory() as temp_dir:  # todo ---> remove this and use decord
+        # get all frames
+        # frames = vr.get_batch(list(np.arange(first_frame_idx, frames_to_track))).asnumpy()
+        frames = vr.get_batch(list(np.arange(frames_to_track))).asnumpy()
+        n_frames, height, width, _ = frames.shape
+        logger.debug(f'Video width={width}, height={height}')
 
-            # # use persisted dir for debug
-            # temp_dir = '/tmp/frames'
-            # os.makedirs(temp_dir, exist_ok=True)
+        # get inference state
+        with torch.inference_mode(), get_safe_autocast():
 
-            # get all frames
-            frames = vr.get_batch(list(np.arange(first_frame_idx, last_frame_idx + frames_to_track))).asnumpy()
-            n_frames, height, width, _ = frames.shape
-            logger.debug(f'Video width={width}, height={height}')
+            inference_state = get_inference_state(video_path)
+            predictor.reset_state(inference_state)
 
-            # get inference state
-            with torch.inference_mode(), get_safe_autocast():
+            # Group prompts by 'obj_id' and sort them by 'frame_idx' in one step
+            prompt_id_dict = defaultdict(list)
+            [prompt_id_dict[prompt['obj_id']].append(prompt) for prompt in prompts]
 
-                inference_state = get_inference_state(video_path)
-                predictor.reset_state(inference_state)
+            # Sort the prompts and extract the highest frame index for each object ID
+            highest_frames = [sorted(prompts, key=lambda x: x['frame_idx'])[-1]['frame_idx'] for prompts in
+                              prompt_id_dict.values() if prompts]
 
-                # Group prompts by 'obj_id' and sort them by 'frame_idx' in one step
-                prompt_id_dict = defaultdict(list)
-                [prompt_id_dict[prompt['obj_id']].append(prompt) for prompt in prompts]
+            # Get the minimum value of the highest frame indices
+            prompt_idx = min(highest_frames) if highest_frames else None
 
-                # Sort the prompts and extract the highest frame index for each object ID
-                highest_frames = [sorted(prompts, key=lambda x: x['frame_idx'])[-1]['frame_idx'] for prompts in
-                                  prompt_id_dict.values() if prompts]
+            for prompt in prompts:
 
-                # Get the minimum value of the highest frame indices
-                prompt_idx = min(highest_frames) if highest_frames else None
-
-                for prompt in prompts:
-
-                    frame_idx = prompt['frame_idx'] - first_frame_idx
-                    # sam 2 not predict other frame if are present prompts after the frame: the prompt must be set in the same frame for each object
-                    if frame_idx > prompt_idx:
-                        logger.warning(f'Prompt frame index {frame_idx} is out of bounds')
-                        continue
+                frame_idx = prompt['frame_idx']# - first_frame_idx
+                # # sam 2 not predict other frame if are present prompts after the frame: the prompt must be set in the same frame for each object
+                # if frame_idx > prompt_idx:
+                #     logger.warning(f'Prompt frame index {frame_idx} is out of bounds')
+                #     continue
 
 
-                    if PROMPT_TYPE == 'point':
-                        # multiply points by the frame size
-                        prompt['points'][:, 0] *= width
-                        prompt['points'][:, 1] *= height
-                        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                            inference_state=inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=obj_ids[prompt['obj_id']],
-                            points=prompt['points'],
-                            labels=prompt['labels']
-                        )
-                    elif PROMPT_TYPE == 'box':
-                        # multiply points by the frame size
-                        prompt['points'][0] *= width
-                        prompt['points'][1] *= height
-                        prompt['points'][2] *= width
-                        prompt['points'][3] *= height
-                        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
-                            inference_state=inference_state,
-                            frame_idx=frame_idx,
-                            obj_id=obj_ids[prompt['obj_id']],
-                            box=prompt['points'],
-                        )
-                if DEBUG:
-                  debug_dir = './debug-frames'
-                  os.makedirs(debug_dir, exist_ok=True)
-
-                sequences = dict()
-                logger.info(f'Propagating in video from frame {last_frame_idx} to {last_frame_idx + frames_to_track}')
-                for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
-                    inference_state=inference_state,
-                    start_frame_idx=last_frame_idx,
-                    max_frame_num_to_track=frames_to_track
-                ):
-                    real_frame_idx = out_frame_idx + first_frame_idx
-                    for i, out_obj_id in enumerate(out_obj_ids):
-                        mask = (out_mask_logits[i] > 0.0).cpu().numpy()
-
-                        if DEBUG:
-
-                          # to debug, save the mask as an image
-                          dump_image_with_mask(frames[out_frame_idx], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
-
-                        bbox = convert_mask_to_bbox(mask)
-                        if bbox:
-                            obj_id = next((k for k, v in obj_ids.items() if v == out_obj_id), None)
-                            sequences[obj_id] = sequences.get(obj_id, [])
-                            sequences[obj_id].append({
-                                'frame': real_frame_idx + 1,
-                                # 'x': bbox['x'] / width * 100,
-                                # 'y': bbox['y'] / height * 100,
-                                # 'width': bbox['width'] / width * 100,
-                                # 'height': bbox['height'] / height * 100,
-                                'x': bbox['x'],
-                                'y': bbox['y'],
-                                'width': bbox['width'],
-                                'height': bbox['height'],
-                                'enabled': True,
-                                'rotation': 0,
-                                'time': out_frame_idx / fps
-                            })
-            result = []
-            for obj_id in all_obj_ids:
-                # find the context to use by searching on drafts by obj_id
-                context_result_sequence = next((ctx['value']['sequence'] for ctx in drafts["result"] if ctx['id'] == obj_id), [])
-                # take the old sequence only for the frames before the first frame of the new sequence
-                # and after the last frame of the new sequence
-                new_sequence = [s for s in context_result_sequence if s['frame'] < sequences[obj_id][0]['frame']] + \
-                               sequences[obj_id] + \
-                               [s for s in context_result_sequence if s['frame'] >= sequences[obj_id][-1]['frame']]
-                # take the old labels: take from context if present, otherwise from drafts
-                labels = next((ctx['value'].get('labels', None) for ctx in context["result"] if ctx['id'] == obj_id), None) or \
-                         next((ctx['value'].get('labels', None) for ctx in drafts["result"] if ctx['id'] == obj_id), None)
-                result.append({
-                    'value': {
-                        'framesCount': frames_count,
-                        'duration': duration,
-                        'sequence': new_sequence,
-                        'labels': labels if labels else []
-                    },
-                    'from_name': from_name,
-                    'to_name': to_name,
-                    'type': 'videorectangle',
-                    'origin': 'manual',
-                    'id': obj_id
-                })
-
-            old_valid_result = [r for r in annotation_result if r['from_name'] != from_name or r['to_name'] != to_name]
-            result = result + old_valid_result
-            prediction = PredictionValue(
-                model_version=MODEL_CONFIG,
-                score=1.0,
-                result=result
-            )
-            logger.debug(f'Prediction: {prediction.model_dump()}')
-            if DEBUG:
-              with open('prediction.json', 'w') as f:
-                  json.dump(prediction.model_dump(), f, indent=2)
-
-            if ANNOTATION_WORKAROUND:
-                # this is a workaround to update the annotation in the Label Studio since using the model response shows all the objects with the same label
-                # also if the label is different for each object
-                client = LabelStudio(
-                    api_key=LABEL_STUDIO_API_KEY,
-                )
-                if len(tasks[0]['annotations']) == 0:
-                    logger.debug('Creating new annotation')
-                    ann = client.annotations.create(
-                        id=task_id,
-                        result=result,
-                        task=tasks[0]['id'],
-                        project=tasks[0]['project']
+                # if PROMPT_TYPE == 'point':
+                if isinstance(prompt.get('points', False), list):
+                    print(f'Adding new points for object {prompt["obj_id"]} at frame {frame_idx}')
+                    # multiply points by the frame size
+                    prompt['points'][:, 0] *= width
+                    prompt['points'][:, 1] *= height
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_ids[prompt['obj_id']],
+                        points=prompt['points'],
+                        labels=prompt['labels']
                     )
-                    client.annotations.get(id=ann.id)
-                else:
-                    logger.debug(f'Updating annotation: {tasks[0]["annotations"][0]["id"]}')
-                    ann = client.annotations.update(
-                        id=tasks[0]['annotations'][0]['id'],
-                        result=result,
-                        task=task_id,
-                        project=tasks[0]['project']
-                    ) # perche se non lo faccio nella UI mette tutti gli oggetti con la stessa label! sempre!
-                # convert annotation to draft making POST request to http://<IP>/api/annotations/{id}/convert-to-draft
-                url = f'{os.getenv("LABEL_STUDIO_URL")}/api/annotations/{ann.id}/convert-to-draft'
-                headers = {
-                    'Authorization': f'Token {os.getenv("LABEL_STUDIO_API_KEY")}'
-                }
-                response = requests.post(url, headers=headers)
-            # raise NotImplementedError('Stop here')
-            return ModelResponse(predictions=[prediction])
+                # elif PROMPT_TYPE == 'box':
+                elif isinstance(prompt.get('box', False), list):
+                    print(f'Adding new box for object {prompt["obj_id"]} at frame {frame_idx}')
+                    # multiply points by the frame size
+                    prompt['box'][0] *= width
+                    prompt['box'][1] *= height
+                    prompt['box'][2] *= width
+                    prompt['box'][3] *= height
+                    _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+                        inference_state=inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_ids[prompt['obj_id']],
+                        box=prompt['box'],
+                    )
+            if DEBUG:
+              debug_dir = '/tmp/sam2_label_studio_debug_frames'
+              os.makedirs(debug_dir, exist_ok=True)
+            # todo aggiungi il modo per non far fare il propagte sempre dall'inizio: come si comunica da quale fram iniziare?
+            # todo quando sam2 non rileva l'oggetto sarebbe opportuno interrompere il keypoint tracking. Come si fa?
+            sequences = dict()
+            start_frame_idx = 0
+            frames_to_track = min(MAX_FRAMES_TO_TRACK, frames_count - start_frame_idx) - 1 # since we are using index
+            logger.info(f'Propagating in video from frame {start_frame_idx} to {start_frame_idx+frames_to_track}')
+            for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(
+                inference_state=inference_state,
+                start_frame_idx=start_frame_idx,
+                max_frame_num_to_track=frames_to_track
+            ):
+                real_frame_idx = out_frame_idx + start_frame_idx
+                for i, out_obj_id in enumerate(out_obj_ids):
+                    mask = (out_mask_logits[i] > 0.0).cpu().numpy()
+
+                    # if DEBUG:
+                    #
+                    #   # to debug, save the mask as an image
+                    #   dump_image_with_mask(frames[out_frame_idx], mask, f'{debug_dir}/{out_frame_idx:05d}_{out_obj_id}.jpg', obj_id=out_obj_id, random_color=True)
+
+                    bbox = convert_mask_to_bbox(mask)
+                    if bbox:
+                        obj_id = next((k for k, v in obj_ids.items() if v == out_obj_id), None)
+                        sequences[obj_id] = sequences.get(obj_id, [])
+                        sequences[obj_id].append({
+                            'frame': real_frame_idx + 1, # +1 because frames are 1-indexed in Label Studio
+                            # 'x': bbox['x'] / width * 100,
+                            # 'y': bbox['y'] / height * 100,
+                            # 'width': bbox['width'] / width * 100,
+                            # 'height': bbox['height'] / height * 100,
+                            'x': bbox['x'],
+                            'y': bbox['y'],
+                            'width': bbox['width'],
+                            'height': bbox['height'],
+                            'enabled': True,
+                            'rotation': 0,
+                            'time': out_frame_idx / fps
+                        })
+        result = []
+        for obj_id in all_obj_ids:
+            # find the context to use by searching on drafts by obj_id
+            context_result_sequence = next((ctx['value']['sequence'] for ctx in drafts["result"] if ctx['id'] == obj_id), [])
+            # take the old sequence only for the frames before the first frame of the new sequence
+            # and after the last frame of the new sequence
+            new_sequence = [s for s in context_result_sequence if s['frame'] < sequences[obj_id][0]['frame']] + \
+                           sequences[obj_id] + \
+                           [s for s in context_result_sequence if s['frame'] > sequences[obj_id][-1]['frame']]
+            new_sequence[-1]['enabled'] = False  # ensure the last frame is enabled
+            # take the old labels: take from context if present, otherwise from drafts
+            labels = next((ctx['value'].get('labels', None) for ctx in context["result"] if ctx['id'] == obj_id), None) or \
+                     next((ctx['value'].get('labels', None) for ctx in drafts["result"] if ctx['id'] == obj_id), None)
+            result.append({
+                'value': {
+                    'framesCount': frames_count,
+                    'duration': duration,
+                    'sequence': new_sequence,
+                    'labels': labels if labels else []
+                },
+                'from_name': from_name,
+                'to_name': to_name,
+                'type': 'videorectangle',
+                'origin': 'manual',
+                'id': obj_id
+            })
+
+        old_valid_result = [r for r in annotation_result if r['from_name'] != from_name or r['to_name'] != to_name]
+        result = result + old_valid_result
+        prediction = PredictionValue(
+            model_version=MODEL_CONFIG,
+            score=1.0,
+            result=result
+        )
+        logger.debug(f'Prediction: {prediction.model_dump()}')
+        if DEBUG:
+          with open('prediction.json', 'w') as f:
+              json.dump(prediction.model_dump(), f, indent=2)
+
+        if ANNOTATION_WORKAROUND:
+            # this is a workaround to update the annotation in the Label Studio since using the model response shows all the objects with the same label
+            # also if the label is different for each object
+            client = LabelStudio(
+                api_key=LABEL_STUDIO_API_KEY,
+            )
+            if len(tasks[0]['annotations']) == 0:
+                logger.debug('Creating new annotation')
+                ann = client.annotations.create(
+                    id=task_id,
+                    result=result,
+                    task=tasks[0]['id'],
+                    project=tasks[0]['project']
+                )
+                client.annotations.get(id=ann.id)
+            else:
+                logger.debug(f'Updating annotation: {tasks[0]["annotations"][0]["id"]}')
+                ann = client.annotations.update(
+                    id=tasks[0]['annotations'][0]['id'],
+                    result=result,
+                    task=task_id,
+                    project=tasks[0]['project']
+                ) # perche se non lo faccio nella UI mette tutti gli oggetti con la stessa label! sempre!
+            # convert annotation to draft making POST request to http://<IP>/api/annotations/{id}/convert-to-draft
+            url = f'{os.getenv("LABEL_STUDIO_URL")}/api/annotations/{ann.id}/convert-to-draft'
+            headers = {
+                'Authorization': f'Token {os.getenv("LABEL_STUDIO_API_KEY")}'
+            }
+            response = requests.post(url, headers=headers)
+        # raise NotImplementedError('Stop here')
+        return ModelResponse(predictions=[prediction])
